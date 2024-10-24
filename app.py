@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import nltk
-nltk.download('punkt')
+nltk.download('punkt', download_dir='./nltk_data')
 from nltk import tokenize
 from bs4 import BeautifulSoup
 import requests
