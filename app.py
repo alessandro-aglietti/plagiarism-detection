@@ -12,6 +12,8 @@ import docx2txt
 from PyPDF2 import PdfReader
 import plotly.express as px
 
+supported_file_types = ["docx", "pdf", "txt", "java"]
+
 def get_sentences(text):
     sentences = tokenize.sent_tokenize(text)
     return sentences
@@ -62,6 +64,9 @@ def get_text_from_file(uploaded_file):
             content = read_pdf_file(uploaded_file)
         elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             content = read_docx_file(uploaded_file)
+        if uploaded_file.type == "application/octet-stream" and uploaded_file.name.endswith(".java"):
+            stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
+            content = stringio.read()
     return content
 
 def get_text(url):
@@ -144,7 +149,7 @@ if option == 'Enter text':
     text = st.text_area("Enter text here", height=200)
     uploaded_files = []
 elif option == 'Upload file':
-    uploaded_file = st.file_uploader("Upload file (.docx, .pdf, .txt)", type=["docx", "pdf", "txt"])
+    uploaded_file = st.file_uploader("Upload file (." + ', .'.join(supported_file_types) + ")", type=supported_file_types)
     if uploaded_file is not None:
         text = get_text_from_file(uploaded_file)
         uploaded_files = [uploaded_file]
@@ -152,7 +157,7 @@ elif option == 'Upload file':
         text = ""
         uploaded_files = []
 else:
-    uploaded_files = st.file_uploader("Upload multiple files (.docx, .pdf, .txt)", type=["docx", "pdf", "txt"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload multiple files (." + ', .'.join(supported_file_types) + ")", type=supported_file_types, accept_multiple_files=True)
     texts = []
     filenames = []
     for uploaded_file in uploaded_files:
