@@ -11,6 +11,7 @@ import io
 import docx2txt
 from PyPDF2 import PdfReader
 import plotly.express as px
+import base64
 
 # Nuovi import per Google APIs e utilità
 import os
@@ -27,15 +28,47 @@ from urllib.parse import urlencode
 
 supported_file_types = ["docx", "pdf", "txt", "java"]
 
+# Utility salvataggio su FS
+def _safe_filename(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name or "file")
+    return name[:120]
+
+def _ensure_output_dir(course_id: str, course_work_id: str) -> str:
+    out_dir = os.path.join(".streamlit", "downloads", str(course_id), str(course_work_id))
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+def _make_download_link(path: str, label: str, filename: str | None = None, mime: str = 'text/plain') -> str:
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode('utf-8')
+        if not filename:
+            filename = os.path.basename(path)
+        href = f"data:{mime};base64,{b64}"
+        return f'<a download="{filename}" href="{href}" target="_blank">{label}</a>'
+    except Exception:
+        return f'<span style="color:red;">Impossibile preparare il download</span>'
+
 # Scopes: Classroom lettura compiti/consegne e Drive read-only
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/classroom.coursework.students.readonly",
-    "https://www.googleapis.com/auth/classroom.student-submissions.students.readonly",
-    "https://www.googleapis.com/auth/classroom.rosters.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.profile"
-]
+def _load_scopes_from_file(path: str = os.path.join(".streamlit", "scopes.txt")) -> List[str]:
+    scopes: List[str] = []
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Accetta separatori: newline, spazi, tab, virgole
+            parts = re.split(r"[\s,]+", content.strip())
+            scopes = [p for p in parts if p]
+    except Exception:
+        scopes = []
+    return scopes
+
+GOOGLE_SCOPES = _load_scopes_from_file()
+
+# This disables the requested scopes and granted scopes check.
+# If users only grant partial request, the warning would not be thrown.
+os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 # --------------------- Helper Google OAuth & Classroom/Drive ---------------------
 def _persist_client_secret(uploaded_json_file) -> str:
@@ -91,9 +124,14 @@ def get_google_credentials(client_secret_path: str) -> Credentials:
         # Se siamo tornati da Google con ?code=..., completa il flow ricostruendo un Flow con lo state
         if 'code' in params and 'state' in params:
             try:
+                returned_scopes = params.get('scope')
+                if isinstance(returned_scopes, list):
+                    returned_scopes = returned_scopes[0]
+                # scopes_list = returned_scopes.split(' ') if returned_scopes else GOOGLE_SCOPES
+                scopes_list = GOOGLE_SCOPES
                 flow = Flow.from_client_secrets_file(
                     client_secrets_file=client_secret_path,
-                    scopes=GOOGLE_SCOPES,
+                    scopes=scopes_list,
                     redirect_uri=redirect_uri,
                     state=params.get('state')
                 )
@@ -125,7 +163,7 @@ def get_google_credentials(client_secret_path: str) -> Credentials:
         )
         # Memorizzare lo state non è più necessario per la finalizzazione, ma lo teniamo per debug
         st.session_state['oauth_state'] = state
-        st.markdown(f"[Continua l'autenticazione Google]({auth_url})")
+        st.markdown(f"<a href=\"{auth_url}\" target=\"_self\">Continua l'autenticazione Google</a>", unsafe_allow_html=True)
         st.stop()
     else:
         # Fallback: ambiente locale, usa server locale
@@ -137,20 +175,36 @@ def get_google_credentials(client_secret_path: str) -> Credentials:
         st.session_state['google_creds'] = creds
         return creds
 
-def parse_coursework_url(url: str) -> Tuple[str, str]:
-    """Estrai course_id e course_work_id da un URL tipo
-    https://classroom.google.com/c/<course_id>/a/<course_work_id>/details
-    """
-    m = re.search(r"/c/([^/]+)/a/([^/]+)/?", url)
-    if not m:
-        raise ValueError("URL di Classroom non valido. Atteso formato .../c/<course_id>/a/<course_work_id>/...")
-    return m.group(1), m.group(2)
 
 def classroom_service(creds: Credentials):
     return build('classroom', 'v1', credentials=creds)
 
 def drive_service(creds: Credentials):
     return build('drive', 'v3', credentials=creds)
+
+# Nuove funzioni: elenco corsi attivi e coursework
+
+def list_active_courses(classroom) -> List[dict]:
+    courses = []
+    page_token = None
+    while True:
+        resp = classroom.courses().list(pageToken=page_token, courseStates=['ACTIVE']).execute()
+        courses.extend(resp.get('courses', []))
+        page_token = resp.get('nextPageToken')
+        if not page_token:
+            break
+    return courses
+
+def list_coursework_for_course(classroom, course_id: str) -> List[dict]:
+    items = []
+    page_token = None
+    while True:
+        resp = classroom.courses().courseWork().list(courseId=course_id, pageToken=page_token).execute()
+        items.extend(resp.get('courseWork', []))
+        page_token = resp.get('nextPageToken')
+        if not page_token:
+            break
+    return items
 
 def list_student_submissions(classroom, course_id: str, course_work_id: str) -> List[dict]:
     submissions = []
@@ -237,13 +291,17 @@ def drive_file_to_text(drive, file_id: str, mime_type_hint: str = None) -> str:
     except Exception:
         return ""
 
-def extract_texts_from_submissions(creds: Credentials, course_id: str, course_work_id: str) -> Tuple[List[str], List[str]]:
-    """Per ogni consegna, concatena il testo degli allegati driveFile e usa il cognome come nome file."""
+def extract_texts_from_submissions(creds: Credentials, course_id: str, course_work_id: str) -> Tuple[List[str], List[str], List[str]]:
+    """Per ogni consegna, concatena il testo degli allegati driveFile, salva un .txt su FS e usa il cognome come nome file.
+    Ritorna (texts, filenames, filepaths).
+    """
     cls = classroom_service(creds)
     drv = drive_service(creds)
     submissions = list_student_submissions(cls, course_id, course_work_id)
     texts: List[str] = []
     names: List[str] = []
+    paths: List[str] = []
+    out_dir = _ensure_output_dir(course_id, course_work_id)
 
     for sub in submissions:
         user_id = sub.get('userId') or sub.get('assignedStudent') or "unknown"
@@ -261,11 +319,20 @@ def extract_texts_from_submissions(creds: Credentials, course_id: str, course_wo
             if txt:
                 agg_text += "\n" + txt
         if agg_text.strip():
+            # Salva su FS
+            base_name = _safe_filename(f"{surname}_{sub.get('id','')}.txt")
+            file_path = os.path.join(out_dir, base_name)
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(agg_text)
+            except Exception:
+                # fallback latin-1
+                with open(file_path, "w", encoding="latin-1", errors="ignore") as f:
+                    f.write(agg_text)
             texts.append(agg_text)
-            # Nome con cognome, eventualmente aggiungi submissionId per univocità
-            fname = f"{surname}_{sub.get('id', '')}.txt" if surname else f"student_{sub.get('id','')}.txt"
-            names.append(fname)
-    return texts, names
+            names.append(base_name)
+            paths.append(file_path)
+    return texts, names, paths
 
 # --------------------- Funzioni esistenti ---------------------
 
@@ -443,15 +510,44 @@ else:
             except Exception as e:
                 st.error(f"Autenticazione fallita: {e}")
 
-    coursework_url = st.text_input("Incolla l'URL del compito Classroom (course_id e course_work_id)")
+    # Se autenticato, mostra selezione corso e coursework
+    selected_course = None
+    selected_coursework = None
+    if st.session_state.get('google_authenticated'):
+        try:
+            creds = st.session_state.get('google_creds')
+            cls = classroom_service(creds)
+            courses = list_active_courses(cls)
+            if not courses:
+                st.warning("Nessun corso ACTIVE trovato per questo account.")
+            else:
+                selected_course = st.selectbox(
+                    "Seleziona un corso",
+                    options=courses,
+                    format_func=lambda c: f"{c.get('name','(senza nome)')} [{c.get('id')}]"
+                )
+                if selected_course:
+                    courseworks = list_coursework_for_course(cls, selected_course.get('id'))
+                    if not courseworks:
+                        st.info("Nessun coursework trovato per questo corso.")
+                    else:
+                        selected_coursework = st.selectbox(
+                            "Seleziona un coursework",
+                            options=courseworks,
+                            format_func=lambda w: f"{w.get('title','(senza titolo)')} [{w.get('id')}]"
+                        )
+        except Exception as e:
+            st.error(f"Errore durante il caricamento di corsi/coursework: {e}")
 
-    if st.session_state.get('google_authenticated') and coursework_url:
+    # Avvio analisi se corso e compito selezionati
+    if selected_course and selected_coursework:
         if st.button('Scarica consegne e analizza'):
             try:
-                course_id, course_work_id = parse_coursework_url(coursework_url)
+                course_id = selected_course.get('id')
+                course_work_id = selected_coursework.get('id')
                 creds = st.session_state.get('google_creds')
                 with st.spinner('Recupero consegne e download allegati da Drive...'):
-                    texts, filenames = extract_texts_from_submissions(creds, course_id, course_work_id)
+                    texts, filenames, filepaths = extract_texts_from_submissions(creds, course_id, course_work_id)
                 if not texts:
                     st.warning("Nessun testo trovato nelle consegne (nessun allegato o permessi insufficienti).")
                 else:
@@ -462,6 +558,7 @@ else:
                     st.write("Anteprima testi per studente (lunghezze):")
                     lengths = pd.DataFrame({
                         'File': filenames,
+                        'Path': filepaths,
                         'Chars': [len(t or '') for t in texts]
                     }).sort_values('Chars', ascending=False)
                     st.dataframe(lengths, use_container_width=True)
@@ -474,6 +571,28 @@ else:
                     plot_histogram(df)
                     plot_3d_scatter(df)
                     plot_violin(df)
+
+                    # Proponi download dei file più simili (top 5 coppie)
+                    st.subheader("Scarica le coppie di elaborati più simili")
+                    # Crea una mappa filename->filepath
+                    path_map = {os.path.basename(p): p for p in filepaths}
+                    top_pairs = df.head(5).to_dict(orient='records')
+                    for i, row in enumerate(top_pairs, start=1):
+                        f1 = row['File 1']
+                        f2 = row['File 2']
+                        sim = row['Similarity']
+                        p1 = path_map.get(f1)
+                        p2 = path_map.get(f2)
+                        cols = st.columns(3)
+                        cols[0].markdown(f"**Coppia {i}** — Similarità: {sim:.3f}")
+                        if p1 and os.path.exists(p1):
+                            cols[1].markdown(_make_download_link(p1, f"Scarica {f1}", f1), unsafe_allow_html=True)
+                        else:
+                            cols[1].write("File 1 non disponibile")
+                        if p2 and os.path.exists(p2):
+                            cols[2].markdown(_make_download_link(p2, f"Scarica {f2}", f2), unsafe_allow_html=True)
+                        else:
+                            cols[2].write("File 2 non disponibile")
             except Exception as e:
                 st.error(f"Errore durante l'analisi Classroom: {e}")
     # Per questo flusso non usiamo la variabile 'text' né il pulsante generale sotto.
