@@ -82,7 +82,7 @@ def list_gemini_models(api_key: str) -> List[str]:
     except Exception:
         return []
 
-def analyze_best_submission_with_gemini(api_key: str, model_name: str, coursework_title: str, filenames: List[str], filepaths: List[str]) -> dict:
+def analyze_best_submission_with_gemini(api_key: str, model_name: str, coursework_title: str, coursework_description: str, filenames: List[str], filepaths: List[str]) -> dict:
     if not api_key:
         raise ValueError("API key di Gemini mancante. Imposta la variabile d'ambiente GOOGLE_API_KEY o inseriscila nel campo dedicato.")
     if not model_name:
@@ -105,12 +105,16 @@ def analyze_best_submission_with_gemini(api_key: str, model_name: str, coursewor
 
     prompt = (
         "Sei un revisore. Ti fornisco gli elaborati degli studenti per il coursework indicato. "
-        "Valuta qualità complessiva, chiarezza, correttezza, completezza e originalità e scegli la migliore consegna. "
-        "Rispondi in JSON con le chiavi: best_file (string, esattamente uno dei nomi file elencati) e reasoning (string sintetica).\n\n"
-        f"Titolo coursework: {coursework_title}\n\n"
+        "Valuta qualità complessiva, chiarezza, correttezza, completezza e originalità, scegli la migliore consegna e individua quelle incomplete rispetto ai requisiti. "
+        "Rispondi in JSON con le chiavi: "
+        "best_file (string, uno dei nomi file elencati), best_reason (string sintetica), "
+        "worst_file (string), worst_reason (string sintetica), "
+        "incomplete (array di oggetti {file: string, reason: string}).\n\n"
+        f"Titolo coursework: [{coursework_title}]\n"
+        f"Descrizione coursework: [{coursework_description}]\n\n"
         "Elenco file consegnati (nome -> risorsa):\n"
         + "\n".join([f"- {m['filename']} -> {m['uri'] or 'inline'}" for m in file_map])
-        + "\n\nAnalizza attentamente gli elaborati e fornisci la scelta."
+        + "\n\nAnalizza attentamente gli elaborati e fornisci la scelta e le valutazioni."
     )
 
     contents = []
@@ -635,6 +639,7 @@ else:
                         'course_id': course_id,
                         'course_work_id': course_work_id,
                         'coursework_title': selected_coursework.get('title', '(senza titolo)'),
+                        'coursework_description': selected_coursework.get('description', ''),
                         'texts': texts,
                         'filenames': filenames,
                         'filepaths': filepaths,
@@ -654,6 +659,7 @@ else:
         texts = analysis.get('texts', [])
         similarities = analysis.get('similarities', [])
         course_work_title = analysis.get('coursework_title', '(senza titolo)')
+        course_work_desc = analysis.get('coursework_description', '')
         if filenames and filepaths and texts and similarities:
             df = pd.DataFrame(similarities, columns=['File 1', 'File 2', 'Similarity'])
             df = df.sort_values(by=['Similarity'], ascending=False)
@@ -726,4 +732,69 @@ else:
                 format_func=_model_label,
                 key='gemini_selected_model'
             )
-            
+            # Analisi con Gemini
+            if st.button("Chiedi a Gemini la migliore consegna", key='gemini_eval_button'):
+                try:
+                    key_to_use = api_key_input or _load_gemini_api_key()
+                    with st.spinner('Analisi con Gemini in corso...'):
+                        gemini_result = analyze_best_submission_with_gemini(key_to_use, selected_model, course_work_title, course_work_desc, filenames, filepaths)
+                    st.session_state['gemini_result'] = gemini_result
+                except Exception as e:
+                    st.session_state['gemini_result'] = {'error': str(e)}
+            # Mostra risultato Gemini se presente
+            gemres = st.session_state.get('gemini_result')
+            if gemres:
+                if 'error' in gemres:
+                    st.error(f"Errore nell'analisi con Gemini: {gemres['error']}")
+                elif 'best_file' in gemres:
+                    st.success(f"Migliore consegna secondo Gemini: {gemres['best_file']}")
+                    st.write(gemres.get('reasoning', ''))
+                    # Tabella di valutazione finale: cognome, valutazione, motivazione sintetica
+                    rows = []
+                    # Helper per cognome da filename (prefisso prima di _)
+                    def _surname_from_filename(fn: str) -> str:
+                        try:
+                            return os.path.basename(fn).split('_')[0]
+                        except Exception:
+                            return fn
+                    best = gemres.get('best_file')
+                    worst = gemres.get('worst_file')
+                    best_reason = gemres.get('best_reason', '')
+                    worst_reason = gemres.get('worst_reason', '')
+                    incomplete_list = gemres.get('incomplete', []) or []
+                    # Mappa filename->(valutazione, motivazione)
+                    eval_map = {}
+                    if isinstance(incomplete_list, list):
+                        for it in incomplete_list:
+                            try:
+                                f = it.get('file') if isinstance(it, dict) else None
+                                r = it.get('reason') if isinstance(it, dict) else ''
+                                if f:
+                                    eval_map[f] = ('incompleto', r or '')
+                            except Exception:
+                                pass
+                    if best:
+                        eval_map[best] = ('migliore', best_reason)
+                    if worst:
+                        # Evita di sovrascrivere un best marcato anche come incompleto per errore del modello
+                        if eval_map.get(worst, ('', ''))[0] != 'migliore':
+                            eval_map[worst] = ('peggiore', worst_reason)
+                    # Costruisci righe per tutti i file conosciuti
+                    for fn in filenames:
+                        label, reason = eval_map.get(fn, ('—', ''))
+                        rows.append({
+                            'Cognome': _surname_from_filename(fn),
+                            'File': fn,
+                            'Valutazione': label,
+                            'Motivazione': reason
+                        })
+                    eval_df = pd.DataFrame(rows)
+                    # Mostra prima migliore, poi incompleti, poi peggiore, poi altri
+                    order = {'migliore': 0, 'incompleto': 1, 'peggiore': 2, '—': 3}
+                    eval_df['order'] = eval_df['Valutazione'].map(lambda x: order.get(x, 4))
+                    eval_df = eval_df.sort_values(['order', 'Cognome']).drop(columns=['order'])
+                    st.dataframe(eval_df, use_container_width=True)
+                 else:
+                     st.info("Risposta di Gemini (non in formato JSON atteso):")
+                     st.write(gemres.get('raw', ''))
+
