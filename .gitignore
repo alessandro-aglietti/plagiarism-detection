@@ -1,2 +1,3 @@
 .venv/
 nltk_data/
+.streamlit/google_client_secret.json
