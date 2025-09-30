@@ -12,6 +12,7 @@ import docx2txt
 from PyPDF2 import PdfReader
 import plotly.express as px
 import base64
+import google.generativeai as genai
 
 # Nuovi import per Google APIs e utilità
 import os
@@ -50,6 +51,92 @@ def _make_download_link(path: str, label: str, filename: str | None = None, mime
     except Exception:
         return f'<span style="color:red;">Impossibile preparare il download</span>'
 
+# Lettura API key di Gemini da file
+
+def _load_gemini_api_key(path: str = os.path.join('.streamlit', 'gemini-api-key.txt')) -> str:
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+# ---------------- Gemini: valutazione migliore consegna ----------------
+
+def list_gemini_models(api_key: str) -> List[str]:
+    if not api_key:
+        return []
+    try:
+        genai.configure(api_key=api_key)
+        models = genai.list_models()
+        names = []
+        for m in models:
+            methods = getattr(m, 'supported_generation_methods', []) or []
+            if 'generateContent' in methods:
+                # usa il nome completo così come restituito (es. models/gemini-1.5-flash-001)
+                names.append(m.name)
+        # ordina con preferenza a flash/pro
+        names.sort()
+        return names
+    except Exception:
+        return []
+
+def analyze_best_submission_with_gemini(api_key: str, model_name: str, coursework_title: str, filenames: List[str], filepaths: List[str]) -> dict:
+    if not api_key:
+        raise ValueError("API key di Gemini mancante. Imposta la variabile d'ambiente GOOGLE_API_KEY o inseriscila nel campo dedicato.")
+    if not model_name:
+        raise ValueError("Modello Gemini non selezionato.")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    # Carica i file (testo) e prepara la mappa nome->file
+    uploads = []
+    file_map = []
+    for name, path in zip(filenames, filepaths):
+        try:
+            f = genai.upload_file(path=path, mime_type='text/plain')
+            uploads.append(f)
+            file_map.append({"filename": name, "uri": f.name})
+        except Exception:
+            # Se upload fallisce, prova a includere solo il testo in prompt
+            uploads.append(None)
+            file_map.append({"filename": name, "uri": None})
+
+    prompt = (
+        "Sei un revisore. Ti fornisco gli elaborati degli studenti per il coursework indicato. "
+        "Valuta qualità complessiva, chiarezza, correttezza, completezza e originalità e scegli la migliore consegna. "
+        "Rispondi in JSON con le chiavi: best_file (string, esattamente uno dei nomi file elencati) e reasoning (string sintetica).\n\n"
+        f"Titolo coursework: {coursework_title}\n\n"
+        "Elenco file consegnati (nome -> risorsa):\n"
+        + "\n".join([f"- {m['filename']} -> {m['uri'] or 'inline'}" for m in file_map])
+        + "\n\nAnalizza attentamente gli elaborati e fornisci la scelta."
+    )
+
+    contents = []
+    # Inserisci prima le risorse file disponibili
+    for f in uploads:
+        if f is not None:
+            contents.append(f)
+    contents.append(prompt)
+
+    resp = model.generate_content(contents)
+    text = resp.text or ""
+    # Prova a estrarre JSON
+    result = {"raw": text}
+    try:
+        import json as _json
+        # Trova primo blocco JSON nel testo
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            parsed = _json.loads(text[start:end+1])
+            if isinstance(parsed, dict) and 'best_file' in parsed:
+                result.update(parsed)
+    except Exception:
+        pass
+    return result
+
 # Scopes: Classroom lettura compiti/consegne e Drive read-only
 def _load_scopes_from_file(path: str = os.path.join(".streamlit", "scopes.txt")) -> List[str]:
     scopes: List[str] = []
@@ -71,15 +158,6 @@ GOOGLE_SCOPES = _load_scopes_from_file()
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 # --------------------- Helper Google OAuth & Classroom/Drive ---------------------
-def _persist_client_secret(uploaded_json_file) -> str:
-    """Persisti il client_secret.json caricato e restituisci il path locale."""
-    target_dir = os.path.join(".streamlit")
-    os.makedirs(target_dir, exist_ok=True)
-    target_path = os.path.join(target_dir, "google_client_secret.json")
-    with open(target_path, "wb") as f:
-        f.write(uploaded_json_file.getbuffer())
-    return target_path
-
 def build_codespaces_redirect_uri(port: int | None = None) -> str | None:
     """Costruisce l'URL pubblico del Codespace per la porta indicata.
     Usa CODESPACE_NAME e GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN.
@@ -551,101 +629,101 @@ else:
                 if not texts:
                     st.warning("Nessun testo trovato nelle consegne (nessun allegato o permessi insufficienti).")
                 else:
-                    # Pairwise similarities tra consegne
+                    # Calcola similarità e salva tutto in sessione per persistere tra i rerun
                     similarities = get_similarity_list(texts, filenames)
-                    df = pd.DataFrame(similarities, columns=['File 1', 'File 2', 'Similarity'])
-                    df = df.sort_values(by=['Similarity'], ascending=False)
-                    st.write("Anteprima testi per studente (lunghezze):")
-                    lengths = pd.DataFrame({
-                        'File': filenames,
-                        'Path': filepaths,
-                        'Chars': [len(t or '') for t in texts]
-                    }).sort_values('Chars', ascending=False)
-                    st.dataframe(lengths, use_container_width=True)
-                    # Grafici
-                    plot_scatter(df)
-                    plot_line(df)
-                    plot_bar(df)
-                    plot_pie(df)
-                    plot_box(df)
-                    plot_histogram(df)
-                    plot_3d_scatter(df)
-                    plot_violin(df)
-
-                    # Proponi download dei file più simili (top 5 coppie)
-                    st.subheader("Scarica le coppie di elaborati più simili")
-                    # Crea una mappa filename->filepath
-                    path_map = {os.path.basename(p): p for p in filepaths}
-                    top_pairs = df.head(5).to_dict(orient='records')
-                    for i, row in enumerate(top_pairs, start=1):
-                        f1 = row['File 1']
-                        f2 = row['File 2']
-                        sim = row['Similarity']
-                        p1 = path_map.get(f1)
-                        p2 = path_map.get(f2)
-                        cols = st.columns(3)
-                        cols[0].markdown(f"**Coppia {i}** — Similarità: {sim:.3f}")
-                        if p1 and os.path.exists(p1):
-                            cols[1].markdown(_make_download_link(p1, f"Scarica {f1}", f1), unsafe_allow_html=True)
-                        else:
-                            cols[1].write("File 1 non disponibile")
-                        if p2 and os.path.exists(p2):
-                            cols[2].markdown(_make_download_link(p2, f"Scarica {f2}", f2), unsafe_allow_html=True)
-                        else:
-                            cols[2].write("File 2 non disponibile")
+                    st.session_state['classroom_analysis'] = {
+                        'course_id': course_id,
+                        'course_work_id': course_work_id,
+                        'coursework_title': selected_coursework.get('title', '(senza titolo)'),
+                        'texts': texts,
+                        'filenames': filenames,
+                        'filepaths': filepaths,
+                        'similarities': similarities,
+                    }
+                    st.success("Consegne scaricate e analisi calcolata.")
             except Exception as e:
                 st.error(f"Errore durante l'analisi Classroom: {e}")
     # Per questo flusso non usiamo la variabile 'text' né il pulsante generale sotto.
     text = ""
 
-if st.button('Check for plagiarism or find similarities'):
-    st.write("""
-    ### Checking for plagiarism or finding similarities...
-    """)
-    if not text:
-        st.write("""
-        ### No text found for plagiarism check or finding similarities.
-        """)
-        st.stop()
-    
-    if option == 'Find similarities between files':
-        similarities = get_similarity_list(texts, filenames)
-        df = pd.DataFrame(similarities, columns=['File 1', 'File 2', 'Similarity'])
-        df = df.sort_values(by=['Similarity'], ascending=False)
-        # Plotting interactive graphs
-        plot_scatter(df)
-        plot_line(df)
-        plot_bar(df)
-        plot_pie(df)
-        plot_box(df)
-        plot_histogram(df)
-        plot_3d_scatter(df)
-        plot_violin(df)
-    else:
-        sentences = get_sentences(text)
-        url = []
-        for sentence in sentences:
-            url.append(get_url(sentence))
+    # Visualizzazione risultati persistenti (grafici, download, Gemini)
+    analysis = st.session_state.get('classroom_analysis')
+    if analysis:
+        filenames = analysis.get('filenames', [])
+        filepaths = analysis.get('filepaths', [])
+        texts = analysis.get('texts', [])
+        similarities = analysis.get('similarities', [])
+        course_work_title = analysis.get('coursework_title', '(senza titolo)')
+        if filenames and filepaths and texts and similarities:
+            df = pd.DataFrame(similarities, columns=['File 1', 'File 2', 'Similarity'])
+            df = df.sort_values(by=['Similarity'], ascending=False)
+            st.write("Anteprima testi per studente (lunghezze):")
+            lengths = pd.DataFrame({
+                'File': filenames,
+                'Path': filepaths,
+                'Chars': [len(t or '') for t in texts]
+            }).sort_values('Chars', ascending=False)
+            st.dataframe(lengths, use_container_width=True)
+            # Grafici
+            plot_scatter(df)
+            plot_line(df)
+            plot_bar(df)
+            plot_pie(df)
+            plot_box(df)
+            plot_histogram(df)
+            plot_3d_scatter(df)
+            plot_violin(df)
 
-        if None in url:
-            st.write("""
-            ### No plagiarism detected!
-            """)
-            st.stop()
+            # Proponi download dei file più simili (top 5 coppie)
+            st.subheader("Scarica le coppie di elaborati più simili")
+            path_map = {os.path.basename(p): p for p in filepaths}
+            top_pairs = df.head(5).to_dict(orient='records')
+            for i, row in enumerate(top_pairs, start=1):
+                f1 = row['File 1']
+                f2 = row['File 2']
+                sim = row['Similarity']
+                p1 = path_map.get(f1)
+                p2 = path_map.get(f2)
+                cols = st.columns(3)
+                cols[0].markdown(f"**Coppia {i}** — Similarità: {sim:.3f}")
+                if p1 and os.path.exists(p1):
+                    cols[1].markdown(_make_download_link(p1, f"Scarica {f1}", f1), unsafe_allow_html=True)
+                else:
+                    cols[1].write("File 1 non disponibile")
+                if p2 and os.path.exists(p2):
+                    cols[2].markdown(_make_download_link(p2, f"Scarica {f2}", f2), unsafe_allow_html=True)
+                else:
+                    cols[2].write("File 2 non disponibile")
 
-        similarity_list = get_similarity_list2(text, url)
-        df = pd.DataFrame({'Sentence': sentences, 'URL': url, 'Similarity': similarity_list})
-        df = df.sort_values(by=['Similarity'], ascending=True)
-    
-    df = df.reset_index(drop=True)
-    
-    # Make URLs clickable in the DataFrame
-    if 'URL' in df.columns:
-        df['URL'] = df['URL'].apply(lambda x: '<a href="{}">{}</a>'.format(x, x) if x else '')
-    
-    # Center align URL column header
-    df_html = df.to_html(escape=False)
-    if 'URL' in df.columns:
-        df_html = df_html.replace('<th>URL</th>', '<th style="text-align: center;">URL</th>')
-    st.write(df_html, unsafe_allow_html=True)
-
+            # Sezione Gemini (persistente)
+            st.subheader("Valutazione automatica con Gemini")
+            default_key = _load_gemini_api_key()
+            api_key_input = st.text_input(
+                "Gemini API Key (lascia vuoto per usare la chiave nel file .streamlit/gemini-api-key.txt)",
+                value=default_key,
+                type='password',
+                key='gemini_key_input'
+            )
+            # Carica e mostra i modelli disponibili (persisti in sessione per evitare richieste ripetute)
+            key_used_for_models = st.session_state.get('gemini_models_key')
+            models_list = st.session_state.get('gemini_models', [])
+            current_key = api_key_input or _load_gemini_api_key()
+            if current_key and (not models_list or key_used_for_models != current_key):
+                models_list = list_gemini_models(current_key)
+                st.session_state['gemini_models'] = models_list
+                st.session_state['gemini_models_key'] = current_key
+            if not models_list:
+                st.info("Nessun modello disponibile. Inserisci una API key valida e aggiorna.")
+            # Select modello
+            def _model_label(name: str) -> str:
+                try:
+                    return name.split('/')[-1]
+                except Exception:
+                    return name
+            selected_model = st.selectbox(
+                "Seleziona il modello Gemini",
+                options=models_list,
+                format_func=_model_label,
+                key='gemini_selected_model'
+            )
+            
