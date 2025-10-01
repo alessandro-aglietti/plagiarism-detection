@@ -794,7 +794,7 @@ else:
                     eval_df['order'] = eval_df['Valutazione'].map(lambda x: order.get(x, 4))
                     eval_df = eval_df.sort_values(['order', 'Cognome']).drop(columns=['order'])
                     st.dataframe(eval_df, use_container_width=True)
-                 else:
-                     st.info("Risposta di Gemini (non in formato JSON atteso):")
-                     st.write(gemres.get('raw', ''))
+                else:
+                    st.info("Risposta di Gemini (non in formato JSON atteso):")
+                    st.write(gemres.get('raw', ''))
 
