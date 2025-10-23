@@ -172,6 +172,12 @@ def build_codespaces_redirect_uri(port: int | None = None) -> str | None:
         port = int(os.getenv("STREAMLIT_SERVER_PORT", "8501"))
     if cs and domain:
         return f"https://{cs}-{port}.{domain}"
+
+    # Support for non HTTPS call on localhost
+    # google_auth_oauthlib https://googleapis.dev/python/google-auth-oauthlib/latest/reference/google_auth_oauthlib.flow.html#google_auth_oauthlib.flow.Flow.from_client_secrets_file
+    # under the hood uses requests-oauthlib
+    # https://requests-oauthlib.readthedocs.io/en/latest/examples/real_world_example.html
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = "1"
     return "http://localhost:8501"
 
 def get_google_credentials(client_secret_path: str) -> Credentials:
