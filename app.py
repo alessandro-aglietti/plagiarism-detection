@@ -172,7 +172,7 @@ def build_codespaces_redirect_uri(port: int | None = None) -> str | None:
         port = int(os.getenv("STREAMLIT_SERVER_PORT", "8501"))
     if cs and domain:
         return f"https://{cs}-{port}.{domain}"
-    return None
+    return "http://localhost:8501"
 
 def get_google_credentials(client_secret_path: str) -> Credentials:
     """OAuth flow compatibile con Codespaces: usa redirect all'URL pubblico del Codespace.
